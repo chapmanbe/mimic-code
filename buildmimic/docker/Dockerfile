@@ -11,7 +11,7 @@ RUN mkdir /mimic-code \
  && cd /mimic-code \
  # clone the postgres build scripts into a local folder
  && git init \
- && git remote add -f origin https://github.com/MIT-lcp/mimic-code \
+ && git remote add -f origin https://github.com/chapmanbe/mimic-code \
  && git config core.sparseCheckout true \
  && echo "buildmimic/postgres/" >> .git/info/sparse-checkout \
  && echo "buildmimic/docker/"   >> .git/info/sparse-checkout \
@@ -19,6 +19,6 @@ RUN mkdir /mimic-code \
  # copy the build scripts into a different folder and remove the temp folder
  && cp -r buildmimic /docker-entrypoint-initdb.d/ \
  && cp buildmimic/docker/setup.sh /docker-entrypoint-initdb.d/ \
- && rm -rf /mimic-code \ 
+ && rm -rf /mimic-code \
  # make a directory for the data
  mkdir /mimic_data
