@@ -84,25 +84,7 @@ with co_stg as
   and valuenum > 0 and valuenum < 300
   group by ce.icustay_id, ce.charttime
 )
-, pafi as
-(
-  -- join blood gas to ventilation durations to determine if patient was vent
-  select ie.icustay_id
-  , bg.charttime
-  -- because pafi has an interaction between vent/PaO2:FiO2, we need two columns for the score
-  -- it can happen that the lowest unventilated PaO2/FiO2 is 68, but the lowest ventilated PaO2/FiO2 is 120
-  -- in this case, the SOFA score is 3, *not* 4.
-  , case when vd.icustay_id is null then pao2fio2ratio else null end PaO2FiO2Ratio_novent
-  , case when vd.icustay_id is not null then pao2fio2ratio else null end PaO2FiO2Ratio_vent
-  from icustays ie
-  inner join pivoted_bg_art bg
-    on ie.icustay_id = bg.icustay_id
-  left join ventdurations vd
-    on ie.icustay_id = vd.icustay_id
-    and bg.charttime >= vd.starttime
-    and bg.charttime <= vd.endtime
-)
-, mini_agg_0 as
+, mini_agg as
 (
   select co.icustay_id, co.hr
   -- vitals
@@ -113,6 +95,11 @@ with co_stg as
   , max(labs.bilirubin) as bilirubin_max
   , max(labs.creatinine) as creatinine_max
   , min(labs.platelet) as platelet_min
+  -- because pafi has an interaction between vent/PaO2:FiO2, we need two columns for the score
+  -- it can happen that the lowest unventilated PaO2/FiO2 is 68, but the lowest ventilated PaO2/FiO2 is 120
+  -- in this case, the SOFA score is 3, *not* 4.
+  , min(case when vd.icustay_id is null then pao2fio2ratio else null end) AS PaO2FiO2Ratio_novent
+  , min(case when vd.icustay_id is not null then pao2fio2ratio else null end) AS PaO2FiO2Ratio_vent
   from co
   left join bp
     on co.icustay_id = bp.icustay_id
@@ -126,6 +113,16 @@ with co_stg as
     on co.hadm_id = labs.hadm_id
     and co.starttime < labs.charttime
     and co.endtime >= labs.charttime
+  -- bring in blood gases that occurred during this hour
+  left join pivoted_bg_art bg
+    on co.icustay_id = bg.icustay_id
+    and co.starttime < bg.charttime
+    and co.endtime >= bg.charttime
+  -- at the time of the blood gas, determine if patient was ventilated
+  left join ventdurations vd
+    on co.icustay_id = vd.icustay_id
+    and bg.charttime >= vd.starttime
+    and bg.charttime <= vd.endtime
   group by co.icustay_id, co.hr
 )
 -- sum uo separately to prevent duplicating values
@@ -141,22 +138,14 @@ with co_stg as
     and co.endtime >= uo.charttime
   group by co.icustay_id, co.hr
 )
-, mini_agg as
-(
-  select ma.*, uo.UrineOutput
-  from mini_agg_0 ma 
-  left join uo 
-    on ma.icustay_id = uo.icustay_id
-  and ma.hr = uo.hr
-)
 , scorecomp as
 (
   select
       co.icustay_id
     , co.hr
     , co.starttime, co.endtime
-    , pafi.PaO2FiO2Ratio_novent
-    , pafi.PaO2FiO2Ratio_vent
+    , ma.PaO2FiO2Ratio_novent
+    , ma.PaO2FiO2Ratio_vent
     , epi.vaso_rate as rate_epinephrine
     , nor.vaso_rate as rate_norepinephrine
     , dop.vaso_rate as rate_dopamine
@@ -164,7 +153,7 @@ with co_stg as
     , ma.MeanBP_min
     , ma.GCS_min
     -- uo
-    , ma.urineoutput
+    , uo.urineoutput
     -- labs
     , ma.bilirubin_max
     , ma.creatinine_max
@@ -173,10 +162,12 @@ with co_stg as
   left join mini_agg ma
     on co.icustay_id = ma.icustay_id
     and co.hr = ma.hr
-  left join pafi
-    on co.icustay_id = pafi.icustay_id
-    and co.starttime < pafi.charttime
-    and co.endtime  >= pafi.charttime
+  left join uo 
+    on co.icustay_id = uo.icustay_id
+    and co.hr = uo.hr
+  -- add in dose of vasopressors
+  -- dose tables have 1 row for each start/stop interval,
+  -- so no aggregation needed
   left join epinephrine_dose epi
     on co.icustay_id = epi.icustay_id
     and co.endtime > epi.starttime
@@ -255,25 +246,28 @@ with co_stg as
   , case
     when (Creatinine_Max >= 5.0) then 4
     when
-      SUM(urineoutput) OVER (PARTITION BY icustay_id ORDER BY hr
-      ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING) < 200
+      SUM(urineoutput) OVER W < 200
         then 4
     when (Creatinine_Max >= 3.5 and Creatinine_Max < 5.0) then 3
     when
-      SUM(urineoutput) OVER (PARTITION BY icustay_id ORDER BY hr
-      ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING) < 500
+      SUM(urineoutput) OVER W < 500
         then 3
     when (Creatinine_Max >= 2.0 and Creatinine_Max < 3.5) then 2
     when (Creatinine_Max >= 1.2 and Creatinine_Max < 2.0) then 1
     when coalesce
       (
-        SUM(urineoutput) OVER (PARTITION BY icustay_id ORDER BY hr
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
+        SUM(urineoutput) OVER W
         , Creatinine_Max
       ) is null then null
   else 0 end::SMALLINT
     as renal
   from scorecomp
+  WINDOW W as
+  (
+    PARTITION BY icustay_id
+    ORDER BY hr
+    ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+  )
 )
 , score_final as
 (
@@ -281,58 +275,29 @@ with co_stg as
     -- Combine all the scores to get SOFA
     -- Impute 0 if the score is missing
    -- the window function takes the max over the last 24 hours
-    , coalesce(
-        MAX(respiration) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)::SMALLINT as respiration_24hours
-     , coalesce(
-         MAX(coagulation) OVER (PARTITION BY icustay_id ORDER BY HR
-         ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-        ,0)::SMALLINT as coagulation_24hours
-    , coalesce(
-        MAX(liver) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)::SMALLINT as liver_24hours
-    , coalesce(
-        MAX(cardiovascular) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)::SMALLINT as cardiovascular_24hours
-    , coalesce(
-        MAX(cns) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)::SMALLINT as cns_24hours
-    , coalesce(
-        MAX(renal) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)::SMALLINT as renal_24hours
+    , coalesce(MAX(respiration) OVER W, 0)::SMALLINT as respiration_24hours
+    , coalesce(MAX(coagulation) OVER W, 0)::SMALLINT as coagulation_24hours
+    , coalesce(MAX(liver) OVER W, 0)::SMALLINT as liver_24hours
+    , coalesce(MAX(cardiovascular) OVER W,0)::SMALLINT as cardiovascular_24hours
+    , coalesce(MAX(cns) OVER W,0)::SMALLINT as cns_24hours
+    , coalesce(MAX(renal) OVER W,0)::SMALLINT as renal_24hours
 
     -- sum together data for final SOFA
-    , coalesce(
-        MAX(respiration) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)
-     + coalesce(
-         MAX(coagulation) OVER (PARTITION BY icustay_id ORDER BY HR
-         ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)
-     + coalesce(
-        MAX(liver) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)
-     + coalesce(
-        MAX(cardiovascular) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)
-     + coalesce(
-        MAX(cns) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)
-     + coalesce(
-        MAX(renal) OVER (PARTITION BY icustay_id ORDER BY HR
-        ROWS BETWEEN 24 PRECEDING AND 0 FOLLOWING)
-      ,0)::SMALLINT
+    , (coalesce(MAX(respiration) OVER W,0)
+     + coalesce(MAX(coagulation) OVER W, 0)
+     + coalesce(MAX(liver) OVER W, 0)
+     + coalesce(MAX(cardiovascular) OVER W, 0)
+     + coalesce(MAX(cns) OVER W, 0)
+     + coalesce(MAX(renal) OVER W, 0)
+    )::SMALLINT
     as SOFA_24hours
   from scorecalc s
+  WINDOW W as
+  (
+    PARTITION BY icustay_id
+    ORDER BY hr
+    ROWS BETWEEN 23 PRECEDING AND 0 FOLLOWING
+  )
 )
 select * from score_final
 where hr >= 0

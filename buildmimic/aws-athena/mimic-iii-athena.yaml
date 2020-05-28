@@ -372,7 +372,7 @@ Resources:
           Columns:
           - Name: row_id 
             Type: int
-          - Name: icd9_code
+          - Name: itemid
             Type: int
           - Name: label
             Type: string
